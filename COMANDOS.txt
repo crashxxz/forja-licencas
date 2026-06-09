@@ -7,14 +7,26 @@ python licenca_servidor.py products
 Criar chave Iguatu Individual:
 python licenca_servidor.py create --customer "Cliente" --product igt_individual --months 1 --max-machines 1
 
+Criar chave Iguatu Individual por 3 dias:
+python licenca_servidor.py create --customer "Cliente" --product igt_individual --months 0 --days 3 --max-machines 1
+
 Criar chave Juazeiro Individual:
 python licenca_servidor.py create --customer "Cliente" --product jua_individual --months 1 --max-machines 1
+
+Criar chave Juazeiro Individual por 3 dias:
+python licenca_servidor.py create --customer "Cliente" --product jua_individual --months 0 --days 3 --max-machines 1
 
 Criar chave Juazeiro Empresa:
 python licenca_servidor.py create --customer "Cliente" --product jua_emp --months 1 --max-machines 1
 
+Criar chave Juazeiro Empresa por 3 dias:
+python licenca_servidor.py create --customer "Cliente" --product jua_emp --months 0 --days 3 --max-machines 1
+
 Renovar:
 python licenca_servidor.py renew --key DOCFLOW-XXXX-XXXX-XXXX-XXXX --months 1
+
+Renovar por 3 dias:
+python licenca_servidor.py renew --key DOCFLOW-XXXX-XXXX-XXXX-XXXX --months 0 --days 3
 
 Bloquear:
 python licenca_servidor.py block --key DOCFLOW-XXXX-XXXX-XXXX-XXXX
@@ -27,3 +39,9 @@ python licenca_servidor.py list
 
 Uso:
 python licenca_servidor.py usage
+
+Tolerancia padrao apos vencimento:
+3 dias.
+
+Configurar no Render, se quiser mudar:
+PAYMENT_GRACE_DAYS=3

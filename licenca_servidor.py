@@ -74,6 +74,17 @@ def add_months(base_date, months):
     return base_date + timedelta(days=30 * int(months))
 
 
+def add_period(base_date, months=0, days=0):
+    return base_date + timedelta(days=(30 * int(months)) + int(days))
+
+
+def payment_grace_days():
+    try:
+        return max(0, int(os.getenv("PAYMENT_GRACE_DAYS", "3") or 0))
+    except Exception:
+        return 3
+
+
 def normalize_product(value):
     product = str(value or "").strip().lower()
     return product if product in PRODUCTS else ""
@@ -199,6 +210,17 @@ def license_response(payload, activate=False):
                 "product": product,
             }
         if expires < today():
+            grace_days = payment_grace_days()
+            grace_until = expires + timedelta(days=grace_days)
+            if grace_days and grace_until >= today():
+                return {
+                    "ok": True,
+                    "status": "active",
+                    "message": f"Licenca vencida em {expires.strftime('%d/%m/%Y')}. Tolerancia ate {grace_until.strftime('%d/%m/%Y')}.",
+                    "customer": row["customer"],
+                    "expires_at": row["expires_at"],
+                    "product": product,
+                }
             return {
                 "ok": False,
                 "status": "expired",
@@ -314,7 +336,7 @@ def cmd_create(args):
     if not product:
         raise SystemExit("Produto invalido. Use: " + ", ".join(PRODUCTS))
     key = (args.key or make_key()).upper()
-    expires = add_months(today(), args.months).strftime("%Y-%m-%d")
+    expires = add_period(today(), args.months, args.days).strftime("%Y-%m-%d")
     with connect() as conn:
         conn.execute(
             sql(
@@ -337,7 +359,7 @@ def cmd_renew(args):
             raise SystemExit("Licenca nao encontrada.")
         current = datetime.strptime(row["expires_at"], "%Y-%m-%d").date()
         base = max(current, today())
-        expires = add_months(base, args.months).strftime("%Y-%m-%d")
+        expires = add_period(base, args.months, args.days).strftime("%Y-%m-%d")
         conn.execute(sql("UPDATE licenses SET status = 'active', expires_at = ? WHERE license_key = ?"), (expires, key))
     print(f"Renovada: {key} ate {expires}")
 
@@ -415,6 +437,7 @@ def main():
     create.add_argument("--customer", required=True)
     create.add_argument("--product", required=True, choices=sorted(PRODUCTS))
     create.add_argument("--months", type=int, default=1)
+    create.add_argument("--days", type=int, default=0)
     create.add_argument("--max-machines", type=int, default=1)
     create.add_argument("--notes", default="")
     create.add_argument("--key")
@@ -422,6 +445,7 @@ def main():
     renew = sub.add_parser("renew")
     renew.add_argument("--key", required=True)
     renew.add_argument("--months", type=int, default=1)
+    renew.add_argument("--days", type=int, default=0)
 
     block = sub.add_parser("block")
     block.add_argument("--key", required=True)
