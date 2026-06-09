@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: forja-licencas
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python licenca_servidor.py serve --host 0.0.0.0
+    envVars:
+      - key: DATABASE_URL
+        sync: false

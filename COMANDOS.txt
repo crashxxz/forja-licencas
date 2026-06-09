@@ -1,0 +1,29 @@
+Iniciar local:
+python licenca_servidor.py serve --host 0.0.0.0
+
+Produtos:
+python licenca_servidor.py products
+
+Criar chave Iguatu Individual:
+python licenca_servidor.py create --customer "Cliente" --product igt_individual --months 1 --max-machines 1
+
+Criar chave Juazeiro Individual:
+python licenca_servidor.py create --customer "Cliente" --product jua_individual --months 1 --max-machines 1
+
+Criar chave Juazeiro Empresa:
+python licenca_servidor.py create --customer "Cliente" --product jua_emp --months 1 --max-machines 1
+
+Renovar:
+python licenca_servidor.py renew --key DOCFLOW-XXXX-XXXX-XXXX-XXXX --months 1
+
+Bloquear:
+python licenca_servidor.py block --key DOCFLOW-XXXX-XXXX-XXXX-XXXX
+
+Liberar:
+python licenca_servidor.py unblock --key DOCFLOW-XXXX-XXXX-XXXX-XXXX
+
+Listar:
+python licenca_servidor.py list
+
+Uso:
+python licenca_servidor.py usage
