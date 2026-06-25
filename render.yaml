@@ -8,3 +8,7 @@ services:
     envVars:
       - key: DATABASE_URL
         sync: false
+      - key: DOCFLOW_LICENSE_PRIVATE_N
+        sync: false
+      - key: DOCFLOW_LICENSE_PRIVATE_D
+        sync: false

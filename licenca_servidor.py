@@ -18,8 +18,6 @@ PRODUCTS = {
     "jua_individual": "Juazeiro Individual",
     "jua_emp": "Juazeiro Empreendimento",
 }
-SERVER_PRIVATE_N = 106537066273957117313240081191464501776242139540655222201529619101456358428722342219026162145204400278649468892608116521900175108380436076142564087603617812966525658915872695062426607701605335357569720938503943724353653006144864421556018622385064111695239492576954703686891896730872157517023773123420441223623
-SERVER_PRIVATE_D = 94491356810752786335454875862737951000925078125023514974873921136310080510037743353606874391783209103209754464205441034354509338615280037199426624962013692837704055071583450879156276390289359042163872344010887756878358144148264090362487014248204716759664880869180292151124282841031671103215732400326777800953
 SERVER_SIGNATURE_FIELDS = ("license_key", "machine_id", "product", "ok", "status", "expires_at", "customer", "message", "issued_at")
 
 
@@ -35,6 +33,14 @@ def load_env_file():
 
 
 load_env_file()
+
+
+def license_private_key():
+    n = os.getenv("DOCFLOW_LICENSE_PRIVATE_N", "").strip()
+    d = os.getenv("DOCFLOW_LICENSE_PRIVATE_D", "").strip()
+    if not n or not d:
+        raise RuntimeError("DOCFLOW_LICENSE_PRIVATE_N/D ausente no ambiente.")
+    return int(n), int(d)
 
 
 def database_url():
@@ -160,9 +166,10 @@ def sign_response(data, payload):
     data.setdefault("product", normalize_product(payload.get("product")))
     data.setdefault("issued_at", datetime.now().isoformat(timespec="seconds"))
     digest_info = bytes.fromhex("3031300d060960864801650304020105000420") + hashlib.sha256(signature_payload(data)).digest()
-    key_len = (SERVER_PRIVATE_N.bit_length() + 7) // 8
+    private_n, private_d = license_private_key()
+    key_len = (private_n.bit_length() + 7) // 8
     padded = b"\x00\x01" + (b"\xff" * (key_len - len(digest_info) - 3)) + b"\x00" + digest_info
-    signature = pow(int.from_bytes(padded, "big"), SERVER_PRIVATE_D, SERVER_PRIVATE_N).to_bytes(key_len, "big")
+    signature = pow(int.from_bytes(padded, "big"), private_d, private_n).to_bytes(key_len, "big")
     data["signature"] = base64.urlsafe_b64encode(signature).decode("ascii")
     return data
 

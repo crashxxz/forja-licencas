@@ -1,6 +1,21 @@
 Iniciar local:
 python licenca_servidor.py serve --host 0.0.0.0
 
+MENU SIMPLES:
+Abrir o arquivo ABRIR_MENU_LICENCAS.bat
+
+No menu:
+1 = criar teste 30 dias
+2 = criar teste 3 dias
+3 = criar mensal 30 dias
+4 = adicionar tempo na mesma chave
+5 = listar chaves
+
+Importante:
+"Credito" = adicionar tempo na mesma chave.
+Exemplo: cliente pagou mais 30 dias -> opcao 4 -> colar chave -> dias 30.
+Nao precisa gerar chave nova todo mes.
+
 Produtos:
 python licenca_servidor.py products
 
