@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta
@@ -18,6 +19,7 @@ PRODUCTS = {
     "jua_individual": "Juazeiro Individual",
     "jua_emp": "Juazeiro Empreendimento",
 }
+SERVICE_VERSION = "2026-09-25-license-hardening"
 SERVER_SIGNATURE_FIELDS = ("license_key", "machine_id", "product", "ok", "status", "expires_at", "customer", "message", "issued_at")
 
 
@@ -128,6 +130,18 @@ def init_db():
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS activation_aliases (
+                license_key TEXT NOT NULL,
+                machine_id TEXT NOT NULL,
+                activation_machine_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (license_key, machine_id),
+                UNIQUE (license_key, activation_machine_id)
+            )
+            """
+        )
+        conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS usage_events (
                 {usage_id},
@@ -178,14 +192,100 @@ def make_key():
     return "DOCFLOW-" + "-".join(secrets.token_hex(2).upper() for _ in range(4))
 
 
-def get_license(conn, license_key):
-    return conn.execute(sql("SELECT * FROM licenses WHERE license_key = ?"), (license_key,)).fetchone()
+def get_license(conn, license_key, lock=False):
+    query = "SELECT * FROM licenses WHERE license_key = ?"
+    if lock and using_postgres():
+        query += " FOR UPDATE"
+    return conn.execute(sql(query), (license_key,)).fetchone()
+
+
+def normalize_machine_id(value):
+    machine = str(value or "").strip().upper()
+    return machine if re.fullmatch(r"[A-F0-9]{32}", machine) else ""
+
+
+def _fingerprint_v2(stable_value):
+    normalized = "".join(ch for ch in str(stable_value or "").upper() if ch.isalnum())
+    if not normalized:
+        return ""
+    raw = f"DOCFLOW-MACHINE-V2|{normalized}".encode("ascii", "ignore")
+    return hashlib.sha256(raw).hexdigest().upper()[:32]
+
+
+def verified_legacy_machine_id(payload, current):
+    proof = payload.get("migration_proof") or {}
+    if not isinstance(proof, dict):
+        return ""
+    source = str(proof.get("source", "")).strip().lower()
+    stable_value = str(proof.get("stable_value", "")).strip()
+    hostname = str(proof.get("hostname", "")).strip()
+    node = str(proof.get("node", "")).strip()
+    claimed = normalize_machine_id(proof.get("legacy_machine_id"))
+    if source not in {"machine_guid", "uuid", "mac"}:
+        return ""
+    if not stable_value or len(stable_value) > 256 or "|" in stable_value:
+        return ""
+    if not hostname or len(hostname) > 255 or "|" in hostname:
+        return ""
+    if not re.fullmatch(r"\d{1,20}", node):
+        return ""
+    if int(node) < 0 or int(node) > 0xFFFFFFFFFFFF:
+        return ""
+    expected_current = _fingerprint_v2(stable_value)
+    if not expected_current or not secrets.compare_digest(expected_current, current):
+        return ""
+    parts = [stable_value, hostname, node] if source == "machine_guid" else [hostname, node]
+    expected_legacy = hashlib.sha256("|".join(parts).encode("utf-8", "ignore")).hexdigest().upper()[:32]
+    if not claimed or not secrets.compare_digest(expected_legacy, claimed):
+        return ""
+    return claimed
+
+
+def find_activation_machine(conn, license_key, machine_id):
+    direct = conn.execute(
+        sql("SELECT machine_id FROM activations WHERE license_key = ? AND machine_id = ?"),
+        (license_key, machine_id),
+    ).fetchone()
+    if direct:
+        return direct["machine_id"]
+    alias = conn.execute(
+        sql("SELECT activation_machine_id FROM activation_aliases WHERE license_key = ? AND machine_id = ?"),
+        (license_key, machine_id),
+    ).fetchone()
+    return alias["activation_machine_id"] if alias else ""
+
+
+def add_activation_alias(conn, license_key, machine_id, legacy_machine_id, now):
+    legacy = conn.execute(
+        sql("SELECT machine_id FROM activations WHERE license_key = ? AND machine_id = ?"),
+        (license_key, legacy_machine_id),
+    ).fetchone()
+    if not legacy:
+        return ""
+    if using_postgres():
+        query = """
+            INSERT INTO activation_aliases (license_key, machine_id, activation_machine_id, created_at)
+            VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+        """
+    else:
+        query = """
+            INSERT OR IGNORE INTO activation_aliases
+            (license_key, machine_id, activation_machine_id, created_at) VALUES (?, ?, ?, ?)
+        """
+    conn.execute(sql(query), (license_key, machine_id, legacy_machine_id, now))
+    mapped = conn.execute(
+        sql("SELECT activation_machine_id FROM activation_aliases WHERE license_key = ? AND machine_id = ?"),
+        (license_key, machine_id),
+    ).fetchone()
+    if mapped and secrets.compare_digest(mapped["activation_machine_id"], legacy_machine_id):
+        return mapped["activation_machine_id"]
+    return ""
 
 
 def license_response(payload, activate=False):
     init_db()
     license_key = str(payload.get("license_key", "")).strip().upper()
-    machine_id = str(payload.get("machine_id", "")).strip().upper()
+    machine_id = normalize_machine_id(payload.get("machine_id"))
     product = normalize_product(payload.get("product"))
     now = datetime.now().isoformat(timespec="seconds")
     if not license_key or not machine_id:
@@ -193,7 +293,9 @@ def license_response(payload, activate=False):
     if not product:
         return {"ok": False, "status": "invalid_product", "message": "Produto ausente ou invalido.", "product": product}
     with connect() as conn:
-        row = get_license(conn, license_key)
+        if not using_postgres():
+            conn.execute("BEGIN IMMEDIATE")
+        row = get_license(conn, license_key, lock=True)
         if not row:
             return {"ok": False, "status": "invalid", "message": "Licenca nao encontrada.", "product": product}
         if row["product"] != product:
@@ -216,31 +318,15 @@ def license_response(payload, activate=False):
                 "expires_at": row["expires_at"],
                 "product": product,
             }
-        if expires < today():
-            grace_days = payment_grace_days()
-            grace_until = expires + timedelta(days=grace_days)
-            if grace_days and grace_until >= today():
-                return {
-                    "ok": True,
-                    "status": "active",
-                    "message": f"Licenca vencida em {expires.strftime('%d/%m/%Y')}. Tolerancia ate {grace_until.strftime('%d/%m/%Y')}.",
-                    "customer": row["customer"],
-                    "expires_at": row["expires_at"],
-                    "product": product,
-                }
-            return {
-                "ok": False,
-                "status": "expired",
-                "message": f"Licenca vencida em {expires.strftime('%d/%m/%Y')}.",
-                "customer": row["customer"],
-                "expires_at": row["expires_at"],
-                "product": product,
-            }
-        exists = conn.execute(
-            sql("SELECT 1 FROM activations WHERE license_key = ? AND machine_id = ?"),
-            (license_key, machine_id),
-        ).fetchone()
-        if not exists and activate:
+        activation_machine_id = find_activation_machine(conn, license_key, machine_id)
+        if not activation_machine_id:
+            legacy_machine_id = verified_legacy_machine_id(payload, machine_id)
+            if legacy_machine_id:
+                activation_machine_id = add_activation_alias(
+                    conn, license_key, machine_id, legacy_machine_id, now
+                )
+        expired = expires < today()
+        if not activation_machine_id and activate and not expired:
             count = conn.execute(
                 sql("SELECT COUNT(*) AS total FROM activations WHERE license_key = ?"),
                 (license_key,),
@@ -258,16 +344,37 @@ def license_response(payload, activate=False):
                 sql("INSERT INTO activations (license_key, machine_id, first_seen, last_seen) VALUES (?, ?, ?, ?)"),
                 (license_key, machine_id, now, now),
             )
-        elif exists:
+            activation_machine_id = machine_id
+        elif activation_machine_id:
             conn.execute(
                 sql("UPDATE activations SET last_seen = ? WHERE license_key = ? AND machine_id = ?"),
-                (now, license_key, machine_id),
+                (now, license_key, activation_machine_id),
             )
-        elif not activate:
+        else:
             return {
                 "ok": False,
                 "status": "not_activated",
                 "message": "Maquina nao ativada para esta licenca.",
+                "customer": row["customer"],
+                "expires_at": row["expires_at"],
+                "product": product,
+            }
+        if expired:
+            grace_days = payment_grace_days()
+            grace_until = expires + timedelta(days=grace_days)
+            if grace_days and grace_until >= today():
+                return {
+                    "ok": True,
+                    "status": "active",
+                    "message": f"Licenca vencida em {expires.strftime('%d/%m/%Y')}. Tolerancia ate {grace_until.strftime('%d/%m/%Y')}.",
+                    "customer": row["customer"],
+                    "expires_at": row["expires_at"],
+                    "product": product,
+                }
+            return {
+                "ok": False,
+                "status": "expired",
+                "message": f"Licenca vencida em {expires.strftime('%d/%m/%Y')}.",
                 "customer": row["customer"],
                 "expires_at": row["expires_at"],
                 "product": product,
@@ -313,7 +420,12 @@ class LicenseHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._send(200, {"ok": True, "service": "docflow-license", "db": "postgres" if using_postgres() else "sqlite"})
+            self._send(200, {
+                "ok": True,
+                "service": "docflow-license",
+                "version": SERVICE_VERSION,
+                "db": "postgres" if using_postgres() else "sqlite",
+            })
         else:
             self._send(404, {"ok": False, "message": "Nao encontrado."})
 
