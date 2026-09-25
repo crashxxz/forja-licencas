@@ -47,7 +47,7 @@ class LicenseServerTests(unittest.TestCase):
         gc.collect()
         self.temp.cleanup()
 
-    def create_license(self, key="DOCFLOW-TEST", max_machines=1, expires=None):
+    def create_license(self, key="DOCFLOW-0001-0002-0003-0004", max_machines=1, expires=None):
         expires = expires or server.today() + timedelta(days=30)
         with server.connect() as conn:
             conn.execute(

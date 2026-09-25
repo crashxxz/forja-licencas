@@ -1,11 +1,13 @@
 ﻿import argparse
 import base64
+from collections import defaultdict, deque
 import hashlib
 import json
 import os
 import re
 import secrets
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,6 +23,12 @@ PRODUCTS = {
 }
 SERVICE_VERSION = "2026-09-25-license-hardening"
 SERVER_SIGNATURE_FIELDS = ("license_key", "machine_id", "product", "ok", "status", "expires_at", "customer", "message", "issued_at")
+LICENSE_KEY_RE = re.compile(r"^DOCFLOW-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$")
+MACHINE_ID_RE = re.compile(r"^[0-9A-F]{32}$")
+MAX_POST_BYTES = 16 * 1024
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 80
+RATE_LIMITS = defaultdict(deque)
 
 
 def load_env_file():
@@ -113,6 +121,7 @@ def init_db():
                 status TEXT NOT NULL DEFAULT 'active',
                 expires_at TEXT NOT NULL,
                 max_machines INTEGER NOT NULL DEFAULT 1,
+                daily_limit INTEGER NOT NULL DEFAULT 0,
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             )
@@ -156,9 +165,11 @@ def init_db():
         )
         if using_postgres():
             conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS product TEXT NOT NULL DEFAULT 'igt_individual'")
+            conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS daily_limit INTEGER NOT NULL DEFAULT 0")
             conn.execute("ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS product TEXT NOT NULL DEFAULT ''")
         else:
             ensure_sqlite_column(conn, "licenses", "product", "TEXT NOT NULL DEFAULT 'igt_individual'")
+            ensure_sqlite_column(conn, "licenses", "daily_limit", "INTEGER NOT NULL DEFAULT 0")
             ensure_sqlite_column(conn, "usage_events", "product", "TEXT NOT NULL DEFAULT ''")
 
 
@@ -290,6 +301,10 @@ def license_response(payload, activate=False):
     now = datetime.now().isoformat(timespec="seconds")
     if not license_key or not machine_id:
         return {"ok": False, "status": "invalid", "message": "Chave ou maquina ausente.", "product": product}
+    if not LICENSE_KEY_RE.match(license_key):
+        return {"ok": False, "status": "invalid", "message": "Formato de chave invalido.", "product": product}
+    if not MACHINE_ID_RE.match(machine_id):
+        return {"ok": False, "status": "invalid_machine", "message": "Identificador de maquina invalido.", "product": product}
     if not product:
         return {"ok": False, "status": "invalid_product", "message": "Produto ausente ou invalido.", "product": product}
     with connect() as conn:
@@ -379,6 +394,28 @@ def license_response(payload, activate=False):
                 "expires_at": row["expires_at"],
                 "product": product,
             }
+        daily_limit = int(row["daily_limit"] or 0) if "daily_limit" in row.keys() else 0
+        if daily_limit > 0 and not activate:
+            day_start = datetime.combine(today(), datetime.min.time()).isoformat(timespec="seconds")
+            day_end = datetime.combine(today() + timedelta(days=1), datetime.min.time()).isoformat(timespec="seconds")
+            used_today = conn.execute(
+                sql("""
+                    SELECT COUNT(*) AS total
+                    FROM usage_events
+                    WHERE license_key = ? AND product = ? AND event = 'generation_start'
+                      AND created_at >= ? AND created_at < ?
+                """),
+                (license_key, product, day_start, day_end),
+            ).fetchone()["total"]
+            if used_today >= daily_limit:
+                return {
+                    "ok": False,
+                    "status": "daily_limit",
+                    "message": f"Limite diario atingido ({daily_limit}/dia).",
+                    "customer": row["customer"],
+                    "expires_at": row["expires_at"],
+                    "product": product,
+                }
         return {
             "ok": True,
             "status": "active",
@@ -410,6 +447,23 @@ def usage_response(payload):
 
 
 class LicenseHandler(BaseHTTPRequestHandler):
+    def _client_ip(self):
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _rate_limited(self):
+        key = (self._client_ip(), self.path)
+        now = time.time()
+        bucket = RATE_LIMITS[key]
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_MAX:
+            return True
+        bucket.append(now)
+        return False
+
     def _send(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -430,7 +484,13 @@ class LicenseHandler(BaseHTTPRequestHandler):
             self._send(404, {"ok": False, "message": "Nao encontrado."})
 
     def do_POST(self):
-        length = min(int(self.headers.get("Content-Length", "0") or 0), 1024 * 1024)
+        if self._rate_limited():
+            self._send(429, {"ok": False, "message": "Muitas tentativas. Aguarde."})
+            return
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > MAX_POST_BYTES:
+            self._send(413, {"ok": False, "message": "Requisicao grande demais."})
+            return
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except Exception:
@@ -446,7 +506,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
             self._send(404, {"ok": False, "message": "Nao encontrado."})
 
     def log_message(self, fmt, *args):
-        print("%s - %s" % (self.address_string(), fmt % args))
+        print("%s - %s" % (self._client_ip(), fmt % args))
 
 
 def cmd_create(args):
@@ -455,16 +515,18 @@ def cmd_create(args):
     if not product:
         raise SystemExit("Produto invalido. Use: " + ", ".join(PRODUCTS))
     key = (args.key or make_key()).upper()
+    if not LICENSE_KEY_RE.match(key):
+        raise SystemExit("Formato de chave invalido.")
     expires = add_period(today(), args.months, args.days).strftime("%Y-%m-%d")
     with connect() as conn:
         conn.execute(
             sql(
                 """
-                INSERT INTO licenses (license_key, product, customer, status, expires_at, max_machines, notes, created_at)
-                VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
+                INSERT INTO licenses (license_key, product, customer, status, expires_at, max_machines, daily_limit, notes, created_at)
+                VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)
                 """
             ),
-            (key, product, args.customer, expires, args.max_machines, args.notes or "", datetime.now().isoformat(timespec="seconds")),
+            (key, product, args.customer, expires, args.max_machines, args.daily_limit, args.notes or "", datetime.now().isoformat(timespec="seconds")),
         )
     print(json.dumps({"license_key": key, "product": product, "customer": args.customer, "expires_at": expires}, ensure_ascii=False, indent=2))
 
@@ -490,23 +552,89 @@ def cmd_status(args, status):
     print(f"{args.key.upper()}: {status}")
 
 
+def cmd_delete(args):
+    init_db()
+    key = args.key.upper()
+    with connect() as conn:
+        row = get_license(conn, key)
+        if not row:
+            raise SystemExit("Licenca nao encontrada.")
+        conn.execute(sql("DELETE FROM activations WHERE license_key = ?"), (key,))
+        conn.execute(sql("DELETE FROM usage_events WHERE license_key = ?"), (key,))
+        conn.execute(sql("DELETE FROM licenses WHERE license_key = ?"), (key,))
+    print(json.dumps({"license_key": key, "deleted": True}, ensure_ascii=False, indent=2))
+
+
+def cmd_daily_limit(args):
+    init_db()
+    key = args.key.upper()
+    if args.limit < 0:
+        raise SystemExit("Limite precisa ser zero ou maior.")
+    with connect() as conn:
+        row = get_license(conn, key)
+        if not row:
+            raise SystemExit("Licenca nao encontrada.")
+        conn.execute(sql("UPDATE licenses SET daily_limit = ? WHERE license_key = ?"), (args.limit, key))
+    print(json.dumps({"license_key": key, "daily_limit": args.limit}, ensure_ascii=False, indent=2))
+
+
 def cmd_list(_args):
     init_db()
     with connect() as conn:
         rows = conn.execute(
             sql(
                 """
-                SELECT l.license_key, l.product, l.customer, l.status, l.expires_at, l.max_machines,
+                SELECT l.license_key, l.product, l.customer, l.status, l.expires_at, l.max_machines, l.daily_limit,
                        COUNT(a.machine_id) AS machines
                 FROM licenses l
                 LEFT JOIN activations a ON a.license_key = l.license_key
-                GROUP BY l.license_key, l.product, l.customer, l.status, l.expires_at, l.max_machines, l.created_at
+                GROUP BY l.license_key, l.product, l.customer, l.status, l.expires_at, l.max_machines, l.daily_limit, l.created_at
                 ORDER BY l.created_at DESC
                 """
             )
         ).fetchall()
     for row in rows:
-        print(f"{row['license_key']} | {row['product']} | {row['customer']} | {row['status']} | vence {row['expires_at']} | maquinas {row['machines']}/{row['max_machines']}")
+        daily = row["daily_limit"] if "daily_limit" in row.keys() else 0
+        daily_text = "sem limite" if not daily else f"{daily}/dia"
+        print(f"{row['license_key']} | {row['product']} | {row['customer']} | {row['status']} | vence {row['expires_at']} | maquinas {row['machines']}/{row['max_machines']} | uso {daily_text}")
+
+
+def _format_usage_datetime(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "")).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(value)
+
+
+def _format_usage_event(value):
+    labels = {
+        "generation_start": "Geracao iniciada",
+        "usage": "Uso",
+    }
+    return labels.get(str(value or ""), str(value or "-"))
+
+
+def _format_usage_details(value):
+    try:
+        data = json.loads(value or "{}")
+    except Exception:
+        return str(value or "-")
+    if not isinstance(data, dict) or not data:
+        return "-"
+    parts = []
+    if data.get("cliente"):
+        parts.append(f"cliente={data.get('cliente')}")
+    if data.get("modo"):
+        parts.append(f"modo={data.get('modo')}")
+    if data.get("total_documentos") is not None:
+        parts.append(f"docs={data.get('total_documentos')}")
+    docs = data.get("documentos")
+    if isinstance(docs, list) and docs:
+        preview = ", ".join(str(item) for item in docs[:4])
+        if len(docs) > 4:
+            preview += f", +{len(docs) - 4}"
+        parts.append(f"selecionados={preview}")
+    return " | ".join(parts) if parts else json.dumps(data, ensure_ascii=False)
 
 
 def cmd_usage(args):
@@ -522,14 +650,38 @@ def cmd_usage(args):
             raise SystemExit("Produto invalido.")
         clauses.append("product = ?")
         params.append(product)
-    where = "WHERE " + " AND ".join(clauses) if clauses else ""
     with connect() as conn:
+        if clauses:
+            query = "SELECT license_key, machine_id, product, event, details, created_at FROM usage_events WHERE " + " AND ".join(clauses) + " ORDER BY id DESC LIMIT ?"  # nosec B608
+        else:
+            query = "SELECT license_key, machine_id, product, event, details, created_at FROM usage_events ORDER BY id DESC LIMIT ?"
         rows = conn.execute(
-            sql(f"SELECT license_key, machine_id, product, event, details, created_at FROM usage_events {where} ORDER BY id DESC LIMIT ?"),
+            sql(query),
             (*params, args.limit),
         ).fetchall()
+    if not rows:
+        print("Nenhum uso registrado.")
+        return
+    totals = {}
     for row in rows:
-        print(f"{row['created_at']} | {row['product']} | {row['license_key']} | {row['machine_id']} | {row['event']} | {row['details']}")
+        key = (row["license_key"], row["product"], row["event"])
+        totals[key] = totals.get(key, 0) + 1
+    print("RESUMO")
+    for (license_key, product, event), total in sorted(totals.items(), key=lambda item: item[1], reverse=True):
+        print(f"- {product} | {license_key} | {_format_usage_event(event)}: {total}")
+    print("\nHISTORICO")
+    print("Data/hora        | Produto        | Chave                   | Maquina  | Evento            | Detalhes")
+    print("-" * 120)
+    for row in rows:
+        machine_short = str(row["machine_id"] or "")[:8]
+        print(
+            f"{_format_usage_datetime(row['created_at']):16} | "
+            f"{str(row['product'] or '-')[:14]:14} | "
+            f"{str(row['license_key'] or '-')[:23]:23} | "
+            f"{machine_short:8} | "
+            f"{_format_usage_event(row['event'])[:17]:17} | "
+            f"{_format_usage_details(row['details'])}"
+        )
 
 
 def cmd_products(_args):
@@ -558,6 +710,7 @@ def main():
     create.add_argument("--months", type=int, default=1)
     create.add_argument("--days", type=int, default=0)
     create.add_argument("--max-machines", type=int, default=1)
+    create.add_argument("--daily-limit", type=int, default=0)
     create.add_argument("--notes", default="")
     create.add_argument("--key")
 
@@ -571,6 +724,13 @@ def main():
 
     unblock = sub.add_parser("unblock")
     unblock.add_argument("--key", required=True)
+
+    delete = sub.add_parser("delete")
+    delete.add_argument("--key", required=True)
+
+    daily_limit = sub.add_parser("daily-limit")
+    daily_limit.add_argument("--key", required=True)
+    daily_limit.add_argument("--limit", type=int, required=True)
 
     sub.add_parser("list")
 
@@ -597,6 +757,10 @@ def main():
         cmd_status(args, "blocked")
     elif args.cmd == "unblock":
         cmd_status(args, "active")
+    elif args.cmd == "delete":
+        cmd_delete(args)
+    elif args.cmd == "daily-limit":
+        cmd_daily_limit(args)
     elif args.cmd == "list":
         cmd_list(args)
     elif args.cmd == "usage":
