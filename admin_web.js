@@ -11,6 +11,7 @@ const listElement = $("#license-list");
 const appMessage = $("#app-message");
 const detailDialog = $("#detail-dialog");
 const confirmDialog = $("#confirm-dialog");
+const deleteDialog = $("#delete-dialog");
 
 async function api(path, options = {}) {
   const method = options.method || "GET";
@@ -112,6 +113,16 @@ function addDetail(label, value) {
   description.textContent = value;
   wrap.append(term, description);
   $("#detail-fields").appendChild(wrap);
+}
+
+function addDeleteDetail(label, value) {
+  const wrap = document.createElement("div");
+  const term = document.createElement("dt");
+  const description = document.createElement("dd");
+  term.textContent = label;
+  description.textContent = value;
+  wrap.append(term, description);
+  $("#delete-fields").appendChild(wrap);
 }
 
 async function openLicense(key) {
@@ -272,6 +283,44 @@ $("#unblock-button").addEventListener("click", () => currentLicense && confirmAc
   await api(`/admin/licenses/${encodeURIComponent(currentLicense.license_key)}`, { method: "PATCH", body: JSON.stringify({ status: "active" }) });
   detailDialog.close();
 }));
+
+$("#delete-license-button").addEventListener("click", () => {
+  if (!currentLicense) return;
+  $("#delete-fields").replaceChildren();
+  addDeleteDetail("Cliente", currentLicense.customer || "-");
+  addDeleteDetail("Produto", currentLicense.product || "-");
+  addDeleteDetail("Chave", currentLicense.license_key);
+  addDeleteDetail("Status", statusInfo(currentLicense)[0]);
+  addDeleteDetail("Vencimento", formatDate(currentLicense.expires_at));
+  addDeleteDetail("Máquinas", `${currentLicense.machines}/${currentLicense.max_machines}`);
+  $("#delete-confirmation").value = "";
+  $("#delete-error").textContent = "";
+  $("#delete-confirm-button").disabled = true;
+  deleteDialog.showModal();
+});
+
+$("#delete-confirmation").addEventListener("input", () => {
+  $("#delete-confirm-button").disabled = !currentLicense || $("#delete-confirmation").value !== currentLicense.license_key;
+});
+
+$("#delete-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!currentLicense || $("#delete-confirmation").value !== currentLicense.license_key) {
+    $("#delete-error").textContent = "Digite a chave completa exatamente como exibida.";
+    return;
+  }
+  try {
+    await api(`/admin/licenses/${encodeURIComponent(currentLicense.license_key)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirmation_key: $("#delete-confirmation").value }),
+    });
+    deleteDialog.close();
+    detailDialog.close();
+    currentLicense = null;
+    await loadLicenses($("#search").value.trim());
+    appMessage.textContent = "Licença excluída.";
+  } catch (error) { $("#delete-error").textContent = error.message; }
+});
 
 document.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => $("#" + button.dataset.close).close()));
 

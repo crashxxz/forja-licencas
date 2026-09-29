@@ -107,8 +107,31 @@
         <h3>Máquinas vinculadas</h3>
         <div id="activation-list" class="activation-list"></div>
       </div>
+      <div class="detail-section danger-zone">
+        <h3>Exclusão definitiva</h3>
+        <p>Usar somente para testes, erros ou duplicidades. Para cancelamento normal, bloquear a licença.</p>
+        <button id="delete-license-button" class="danger secondary-danger" type="button">Excluir licença</button>
+      </div>
       <p id="detail-error" class="message error" role="alert"></p>
     </section>
+  </dialog>
+
+  <dialog id="delete-dialog">
+    <form id="delete-form" class="dialog-content">
+      <div class="dialog-header">
+        <h2>Excluir licença</h2>
+        <button class="icon-button" type="button" data-close="delete-dialog" aria-label="Fechar">×</button>
+      </div>
+      <dl id="delete-fields" class="detail-grid delete-summary"></dl>
+      <p class="delete-warning">Esta operação excluirá permanentemente esta licença e não poderá ser desfeita.</p>
+      <label for="delete-confirmation">Digite a chave completa para confirmar</label>
+      <input id="delete-confirmation" required autocomplete="off" spellcheck="false">
+      <p id="delete-error" class="message error" role="alert"></p>
+      <div class="dialog-actions">
+        <button class="neutral" type="button" data-close="delete-dialog">Cancelar</button>
+        <button id="delete-confirm-button" class="danger" type="submit" disabled>Excluir definitivamente</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog id="confirm-dialog" class="confirm-dialog">

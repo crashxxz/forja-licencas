@@ -26,7 +26,7 @@ PRODUCTS = {
     "jua_individual": "Juazeiro Individual",
     "jua_emp": "Juazeiro Empreendimento",
 }
-SERVICE_VERSION = "2026-09-29-admin-session"
+SERVICE_VERSION = "2026-09-29-admin-delete"
 SERVER_SIGNATURE_FIELDS = ("license_key", "machine_id", "product", "ok", "status", "expires_at", "customer", "message", "issued_at")
 LICENSE_KEY_RE = re.compile(r"^DOCFLOW-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$")
 MACHINE_ID_RE = re.compile(r"^[0-9A-F]{32}$")
@@ -705,6 +705,28 @@ def admin_unlink_activation(license_key, machine_id):
     return True
 
 
+def admin_delete_license(license_key, confirmation, after_dependents=None):
+    key = str(license_key or "").strip().upper()
+    if str(confirmation or "") != key:
+        raise ValueError("Digite a chave completa exatamente como exibida.")
+    with connect() as conn:
+        if not using_postgres():
+            conn.execute("BEGIN IMMEDIATE")
+        row = get_license(conn, key, lock=True)
+        if not row:
+            return None
+        counts = {}
+        for table in ("activation_aliases", "activations", "usage_events"):
+            cursor = conn.execute(sql(f"DELETE FROM {table} WHERE license_key = ?"), (key,))
+            counts[table] = max(0, cursor.rowcount)
+        if after_dependents:
+            after_dependents()
+        cursor = conn.execute(sql("DELETE FROM licenses WHERE license_key = ?"), (key,))
+        if cursor.rowcount != 1:
+            raise RuntimeError("A licença não foi excluída.")
+    return counts
+
+
 def admin_audit(operation, license_key=""):
     print(json.dumps({"event": "admin_audit", "operation": str(operation),
                       "license_key": str(license_key or "").upper(),
@@ -902,15 +924,32 @@ class LicenseHandler(BaseHTTPRequestHandler):
         if not self._require_admin_session() or not self._require_admin_csrf():
             return
         _parsed, parts = self._admin_parts()
-        if len(parts) != 5 or parts[:2] != ["admin", "licenses"] or parts[3] != "activations":
+        if len(parts) not in {3, 5} or parts[:2] != ["admin", "licenses"]:
             self._send(404, {"ok": False, "message": "Rota administrativa nao encontrada."})
             return
         try:
-            if not admin_unlink_activation(parts[2], parts[4]):
-                self._send(404, {"ok": False, "message": "Ativacao nao encontrada."})
-                return
-            admin_audit("unlink_activation", parts[2])
-            self._send(200, {"ok": True, "message": "Maquina desvinculada."})
+            if len(parts) == 3:
+                payload = self._read_admin_json()
+                key = parts[2].strip().upper()
+                if str(payload.get("confirmation_key", "")) != key:
+                    raise ValueError("Digite a chave completa exatamente como exibida.")
+                if not admin_get_license(key):
+                    self._send(404, {"ok": False, "message": "Licenca nao encontrada."})
+                    return
+                admin_audit("delete_license", key)
+                deleted = admin_delete_license(key, payload.get("confirmation_key"))
+                if deleted is None:
+                    self._send(404, {"ok": False, "message": "Licenca nao encontrada."})
+                    return
+                self._send(200, {"ok": True, "message": "Licença excluída."})
+            elif parts[3] == "activations":
+                if not admin_unlink_activation(parts[2], parts[4]):
+                    self._send(404, {"ok": False, "message": "Ativacao nao encontrada."})
+                    return
+                admin_audit("unlink_activation", parts[2])
+                self._send(200, {"ok": True, "message": "Maquina desvinculada."})
+            else:
+                self._send(404, {"ok": False, "message": "Rota administrativa nao encontrada."})
         except ValueError as exc:
             self._send(400, {"ok": False, "message": str(exc)})
         except Exception as exc:

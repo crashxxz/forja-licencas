@@ -261,6 +261,58 @@ class LicenseServerTests(unittest.TestCase):
         self.assertTrue(server.admin_unlink_activation(key, machine))
         self.assertEqual(server.admin_list_activations(key), [])
 
+    def test_admin_delete_license_removes_dependencies_and_preserves_others(self):
+        key = self.create_license(max_machines=2)
+        other = self.create_license(key="DOCFLOW-AAAA-BBBB-CCCC-DDDD")
+        machine = fingerprint("delete-with-dependencies")
+        self.seed_activation(key, machine)
+        with server.connect() as conn:
+            conn.execute(
+                "INSERT INTO activation_aliases (license_key, machine_id, activation_machine_id, created_at) VALUES (?, ?, ?, ?)",
+                (key, fingerprint("delete-alias"), machine, "2026-01-01T00:00:00"),
+            )
+            conn.execute(
+                "INSERT INTO usage_events (license_key, machine_id, product, event, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (key, machine, "igt_individual", "generation_start", "", "2026-01-01T00:00:00"),
+            )
+
+        with self.assertRaises(ValueError):
+            server.admin_delete_license(key, "")
+        with self.assertRaises(ValueError):
+            server.admin_delete_license(key, "DOCFLOW-FFFF-FFFF-FFFF-FFFF")
+        self.assertIsNotNone(server.admin_get_license(key))
+
+        counts = server.admin_delete_license(key, key)
+        self.assertEqual(counts, {"activation_aliases": 1, "activations": 1, "usage_events": 1})
+        self.assertIsNone(server.admin_get_license(key))
+        self.assertIsNotNone(server.admin_get_license(other))
+        self.assertNotIn(key, [item["license_key"] for item in server.admin_list_licenses()])
+        with server.connect() as conn:
+            for table in ("activation_aliases", "activations", "usage_events"):
+                total = conn.execute(f"SELECT COUNT(*) AS total FROM {table} WHERE license_key = ?", (key,)).fetchone()["total"]
+                self.assertEqual(total, 0)
+
+    def test_admin_delete_license_rolls_back_completely_on_failure(self):
+        key = self.create_license()
+        machine = fingerprint("delete-rollback")
+        self.seed_activation(key, machine)
+        with server.connect() as conn:
+            conn.execute(
+                "INSERT INTO usage_events (license_key, machine_id, product, event, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (key, machine, "igt_individual", "generation_start", "", "2026-01-01T00:00:00"),
+            )
+
+        def fail():
+            raise RuntimeError("falha simulada")
+
+        with self.assertRaises(RuntimeError):
+            server.admin_delete_license(key, key, after_dependents=fail)
+        self.assertIsNotNone(server.admin_get_license(key))
+        self.assertEqual(self.activation_count(key), 1)
+        with server.connect() as conn:
+            total = conn.execute("SELECT COUNT(*) AS total FROM usage_events WHERE license_key = ?", (key,)).fetchone()["total"]
+        self.assertEqual(total, 1)
+
     def test_admin_http_login_and_protected_listing(self):
         password = "Senha-Forte-HTTP-2026"
         os.environ["FORJA_ADMIN_PASSWORD_HASH"] = server.make_admin_password_hash(password, b"FEDCBA9876543210")
@@ -311,7 +363,11 @@ class LicenseServerTests(unittest.TestCase):
             request_headers = {"Accept": "application/json", **(headers or {})}
             if body is not None:
                 request_headers["Content-Type"] = "application/json"
-            response = urlopen(Request(base + path, data=body, headers=request_headers, method=method), timeout=5)
+            try:
+                response = urlopen(Request(base + path, data=body, headers=request_headers, method=method), timeout=5)
+            except HTTPError as exc:
+                exc.read()
+                raise
             return response, json.loads(response.read().decode("utf-8"))
 
         try:
@@ -353,6 +409,19 @@ class LicenseServerTests(unittest.TestCase):
             }, write_headers)
             self.assertEqual(updated["license"]["status"], "blocked")
             self.assertEqual(updated["license"]["expires_at"], "2027-02-01")
+
+            with self.assertRaises(HTTPError) as delete_without_csrf:
+                request_json(f"/admin/licenses/{created_key}", "DELETE", {"confirmation_key": created_key}, auth_headers)
+            self.assertEqual(delete_without_csrf.exception.code, 403)
+            with self.assertRaises(HTTPError) as delete_without_key:
+                request_json(f"/admin/licenses/{created_key}", "DELETE", {}, write_headers)
+            self.assertEqual(delete_without_key.exception.code, 400)
+            with self.assertRaises(HTTPError) as delete_wrong_key:
+                request_json(f"/admin/licenses/{created_key}", "DELETE", {"confirmation_key": "chave-incorreta"}, write_headers)
+            self.assertEqual(delete_wrong_key.exception.code, 400)
+            _, deleted = request_json(f"/admin/licenses/{created_key}", "DELETE", {"confirmation_key": created_key}, write_headers)
+            self.assertEqual(deleted["message"], "Licença excluída.")
+            self.assertIsNone(server.admin_get_license(created_key))
 
             _, activations = request_json(f"/admin/licenses/{key}/activations", headers=auth_headers)
             self.assertEqual(activations["count"], 1)
