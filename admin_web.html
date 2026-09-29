@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FORJA - Administração de Licenças</title>
+  <link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body>
+  <main>
+    <section id="login-view" class="auth-shell">
+      <form id="login-form" class="auth-panel" autocomplete="off">
+        <div class="brand-mark">FORJA</div>
+        <h1>Administração de Licenças</h1>
+        <label for="password">Senha administrativa</label>
+        <input id="password" name="password" type="password" required autocomplete="current-password">
+        <label for="totp">Código autenticador</label>
+        <input id="totp" name="totp" type="text" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
+        <p id="login-error" class="message error" role="alert"></p>
+        <button class="primary" type="submit">Entrar</button>
+      </form>
+    </section>
+
+    <section id="app-view" class="app-shell" hidden>
+      <header class="app-header">
+        <div>
+          <span class="eyebrow">FORJA</span>
+          <h1>Licenças</h1>
+        </div>
+        <button id="logout-button" class="neutral" type="button">Sair</button>
+      </header>
+
+      <div class="toolbar">
+        <form id="search-form" class="search-form">
+          <label class="sr-only" for="search">Pesquisar cliente ou chave</label>
+          <input id="search" type="search" placeholder="Pesquisar cliente ou chave">
+          <button class="neutral" type="submit">Pesquisar</button>
+        </form>
+        <button id="new-license-button" class="primary" type="button">Nova licença</button>
+      </div>
+
+      <p id="app-message" class="message" role="status"></p>
+      <div id="license-list" class="license-list" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <dialog id="create-dialog">
+    <form id="create-form" class="dialog-content">
+      <div class="dialog-header">
+        <h2>Nova licença</h2>
+        <button class="icon-button" type="button" data-close="create-dialog" aria-label="Fechar">×</button>
+      </div>
+      <label for="customer">Cliente</label>
+      <input id="customer" required maxlength="160">
+      <label for="product">Produto</label>
+      <select id="product" required>
+        <option value="igt_individual">Iguatu Individual</option>
+        <option value="jua_individual">Juazeiro Individual</option>
+        <option value="jua_emp">Juazeiro Empreendimento</option>
+      </select>
+      <label for="expires-at">Vencimento</label>
+      <input id="expires-at" type="date" required>
+      <label for="max-machines">Limite de máquinas</label>
+      <input id="max-machines" type="number" min="1" value="1" required>
+      <p id="create-error" class="message error" role="alert"></p>
+      <div id="created-key" class="created-key" hidden>
+        <span>Chave criada</span>
+        <strong></strong>
+        <button id="copy-key-button" class="neutral" type="button">Copiar chave</button>
+      </div>
+      <div class="dialog-actions">
+        <button class="neutral" type="button" data-close="create-dialog">Cancelar</button>
+        <button class="primary" type="submit">Criar licença</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="detail-dialog">
+    <section class="dialog-content wide">
+      <div class="dialog-header">
+        <div><span class="eyebrow">Licença</span><h2 id="detail-customer"></h2></div>
+        <button class="icon-button" type="button" data-close="detail-dialog" aria-label="Fechar">×</button>
+      </div>
+      <dl id="detail-fields" class="detail-grid"></dl>
+
+      <div class="detail-section">
+        <h3>Validade</h3>
+        <div class="expiry-controls">
+          <select id="expiry-operation">
+            <option value="add">Adicionar dias</option>
+            <option value="subtract">Reduzir dias</option>
+            <option value="exact">Definir data exata</option>
+          </select>
+          <input id="expiry-days" type="number" min="1" value="30">
+          <input id="expiry-date" type="date" hidden>
+          <button id="change-expiry-button" class="primary" type="button">Alterar validade</button>
+        </div>
+      </div>
+
+      <div class="detail-section status-actions">
+        <h3>Status</h3>
+        <button id="block-button" class="danger" type="button">Bloquear</button>
+        <button id="unblock-button" class="success" type="button">Liberar</button>
+      </div>
+
+      <div class="detail-section">
+        <h3>Máquinas vinculadas</h3>
+        <div id="activation-list" class="activation-list"></div>
+      </div>
+      <p id="detail-error" class="message error" role="alert"></p>
+    </section>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="confirm-dialog">
+    <section class="dialog-content">
+      <h2 id="confirm-title">Confirmar alteração</h2>
+      <div id="confirm-body" class="confirm-body"></div>
+      <div class="dialog-actions">
+        <button id="confirm-cancel" class="neutral" type="button">Cancelar</button>
+        <button id="confirm-accept" class="primary" type="button">Confirmar</button>
+      </div>
+    </section>
+  </dialog>
+
+  <script src="/admin/admin.js" defer></script>
+</body>
+</html>

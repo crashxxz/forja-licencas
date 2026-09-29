@@ -1,12 +1,15 @@
 import hashlib
 import importlib.util
 import gc
+import json
 import os
 import tempfile
 import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import licenca_servidor as server
 
@@ -29,9 +32,15 @@ class LicenseServerTests(unittest.TestCase):
         self.old_db_path = server.DB_PATH
         self.old_database_url = os.environ.get("DATABASE_URL")
         self.old_grace = os.environ.get("PAYMENT_GRACE_DAYS")
+        self.old_admin_hash = os.environ.get("FORJA_ADMIN_PASSWORD_HASH")
+        self.old_admin_totp = os.environ.get("FORJA_ADMIN_TOTP_SECRET")
         os.environ["DATABASE_URL"] = ""
         os.environ["PAYMENT_GRACE_DAYS"] = "3"
         server.DB_PATH = Path(self.temp.name) / "licenses.sqlite"
+        server.ADMIN_SESSIONS.clear()
+        server.ADMIN_SESSION_CSRF.clear()
+        server.ADMIN_LOGIN_ATTEMPTS.clear()
+        server.ADMIN_LAST_TOTP_COUNTER = -1
         server.init_db()
 
     def tearDown(self):
@@ -44,6 +53,18 @@ class LicenseServerTests(unittest.TestCase):
             os.environ.pop("PAYMENT_GRACE_DAYS", None)
         else:
             os.environ["PAYMENT_GRACE_DAYS"] = self.old_grace
+        if self.old_admin_hash is None:
+            os.environ.pop("FORJA_ADMIN_PASSWORD_HASH", None)
+        else:
+            os.environ["FORJA_ADMIN_PASSWORD_HASH"] = self.old_admin_hash
+        if self.old_admin_totp is None:
+            os.environ.pop("FORJA_ADMIN_TOTP_SECRET", None)
+        else:
+            os.environ["FORJA_ADMIN_TOTP_SECRET"] = self.old_admin_totp
+        server.ADMIN_SESSIONS.clear()
+        server.ADMIN_SESSION_CSRF.clear()
+        server.ADMIN_LOGIN_ATTEMPTS.clear()
+        server.ADMIN_LAST_TOTP_COUNTER = -1
         gc.collect()
         self.temp.cleanup()
 
@@ -201,6 +222,152 @@ class LicenseServerTests(unittest.TestCase):
         self.assertEqual(sum(bool(item["ok"]) for item in results), 1)
         self.assertEqual(sum(item["status"] == "machine_limit" for item in results), 1)
         self.assertEqual(self.activation_count(key), 1)
+
+    def test_admin_password_totp_session_and_expiration(self):
+        password = "Senha-Forte-Teste-2026"
+        secret = "JBSWY3DPEHPK3PXP"
+        fixed_time = 1800000000
+        counter = fixed_time // 30
+        os.environ["FORJA_ADMIN_PASSWORD_HASH"] = server.make_admin_password_hash(password, b"0123456789ABCDEF")
+        os.environ["FORJA_ADMIN_TOTP_SECRET"] = secret
+        code = server.admin_totp_code(counter)
+
+        self.assertIsNone(server.create_admin_session("senha-errada", code))
+        self.assertIsNone(server.create_admin_session(password, "000000"))
+
+        original_time = server.time.time
+        server.time.time = lambda: fixed_time
+        try:
+            token = server.create_admin_session(password, code)
+            self.assertTrue(token)
+            self.assertTrue(server.admin_session_valid(token))
+            self.assertIsNone(server.create_admin_session(password, code))
+            token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+            server.ADMIN_SESSIONS[token_hash] = fixed_time - 1
+            self.assertFalse(server.admin_session_valid(token))
+        finally:
+            server.time.time = original_time
+
+    def test_admin_queries_and_activation_unlink_use_existing_schema(self):
+        key = self.create_license(max_machines=2)
+        machine = fingerprint("admin-machine")
+        self.seed_activation(key, machine)
+        self.assertEqual(len(server.admin_list_licenses("Teste")), 1)
+        self.assertEqual(server.admin_get_license(key)["machines"], 1)
+        updated = server.admin_update_license(key, {"expires_at": "2027-01-15", "status": "blocked"})
+        self.assertEqual(updated["expires_at"], "2027-01-15")
+        self.assertEqual(updated["status"], "blocked")
+        self.assertEqual(len(server.admin_list_activations(key)), 1)
+        self.assertTrue(server.admin_unlink_activation(key, machine))
+        self.assertEqual(server.admin_list_activations(key), [])
+
+    def test_admin_http_login_and_protected_listing(self):
+        password = "Senha-Forte-HTTP-2026"
+        os.environ["FORJA_ADMIN_PASSWORD_HASH"] = server.make_admin_password_hash(password, b"FEDCBA9876543210")
+        os.environ["FORJA_ADMIN_TOTP_SECRET"] = "JBSWY3DPEHPK3PXP"
+        self.create_license()
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.LicenseHandler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+        def post_login(password_value, code_value):
+            body = json.dumps({"password": password_value, "totp": code_value}).encode("utf-8")
+            request = Request(base + "/admin/login", data=body, headers={"Content-Type": "application/json"}, method="POST")
+            return urlopen(request, timeout=5)
+
+        try:
+            with self.assertRaises(HTTPError) as wrong_password:
+                post_login("senha-errada", server.admin_totp_code(int(server.time.time() // 30)))
+            self.assertEqual(wrong_password.exception.code, 401)
+            with self.assertRaises(HTTPError) as wrong_totp:
+                post_login(password, "000000")
+            self.assertEqual(wrong_totp.exception.code, 401)
+
+            response = post_login(password, server.admin_totp_code(int(server.time.time() // 30)))
+            token = json.loads(response.read().decode("utf-8"))["session_token"]
+            request = Request(base + "/admin/licenses", headers={"Authorization": f"Bearer {token}"})
+            listed = json.loads(urlopen(request, timeout=5).read().decode("utf-8"))
+            self.assertEqual(listed["count"], 1)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_admin_web_cookie_csrf_and_crud(self):
+        password = "Senha-Forte-Web-2026"
+        os.environ["FORJA_ADMIN_PASSWORD_HASH"] = server.make_admin_password_hash(password, b"ABCDEF0123456789")
+        os.environ["FORJA_ADMIN_TOTP_SECRET"] = "JBSWY3DPEHPK3PXP"
+        key = self.create_license(max_machines=2)
+        machine = fingerprint("web-admin-machine")
+        self.seed_activation(key, machine)
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.LicenseHandler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+        def request_json(path, method="GET", payload=None, headers=None):
+            body = json.dumps(payload).encode("utf-8") if payload is not None else None
+            request_headers = {"Accept": "application/json", **(headers or {})}
+            if body is not None:
+                request_headers["Content-Type"] = "application/json"
+            response = urlopen(Request(base + path, data=body, headers=request_headers, method=method), timeout=5)
+            return response, json.loads(response.read().decode("utf-8"))
+
+        try:
+            page = urlopen(base + "/admin", timeout=5)
+            html = page.read().decode("utf-8")
+            self.assertIn("Administração de Licenças", html)
+            self.assertNotIn(password, html)
+
+            code = server.admin_totp_code(int(server.time.time() // 30))
+            response, login = request_json("/admin/web-login", "POST", {"password": password, "totp": code})
+            set_cookie = response.headers["Set-Cookie"]
+            self.assertIn("HttpOnly", set_cookie)
+            self.assertIn("Secure", set_cookie)
+            self.assertIn("SameSite=Strict", set_cookie)
+            cookie = set_cookie.split(";", 1)[0]
+            csrf = login["csrf_token"]
+            auth_headers = {"Cookie": cookie}
+            write_headers = {"Cookie": cookie, "X-CSRF-Token": csrf}
+
+            _, session = request_json("/admin/session", headers=auth_headers)
+            self.assertEqual(session["csrf_token"], csrf)
+            _, listed = request_json("/admin/licenses", headers=auth_headers)
+            self.assertEqual(listed["count"], 1)
+
+            with self.assertRaises(HTTPError) as missing_csrf:
+                request_json("/admin/licenses", "POST", {
+                    "customer": "Sem CSRF", "product": "igt_individual",
+                    "expires_at": "2027-01-01", "max_machines": 1,
+                }, auth_headers)
+            self.assertEqual(missing_csrf.exception.code, 403)
+
+            _, created = request_json("/admin/licenses", "POST", {
+                "customer": "Cliente Web", "product": "jua_individual",
+                "expires_at": "2027-01-01", "max_machines": 1,
+            }, write_headers)
+            created_key = created["license"]["license_key"]
+            _, updated = request_json(f"/admin/licenses/{created_key}", "PATCH", {
+                "expires_at": "2027-02-01", "status": "blocked",
+            }, write_headers)
+            self.assertEqual(updated["license"]["status"], "blocked")
+            self.assertEqual(updated["license"]["expires_at"], "2027-02-01")
+
+            _, activations = request_json(f"/admin/licenses/{key}/activations", headers=auth_headers)
+            self.assertEqual(activations["count"], 1)
+            request_json(f"/admin/licenses/{key}/activations/{machine}", "DELETE", headers=write_headers)
+            self.assertEqual(self.activation_count(key), 0)
+
+            logout_response, _ = request_json("/admin/web-logout", "POST", headers=write_headers)
+            self.assertIn("Max-Age=0", logout_response.headers["Set-Cookie"])
+            with self.assertRaises(HTTPError) as logged_out:
+                request_json("/admin/licenses", headers=auth_headers)
+            self.assertEqual(logged_out.exception.code, 401)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
 
 
 class ClientFingerprintTests(unittest.TestCase):

@@ -2,15 +2,20 @@
 import base64
 from collections import defaultdict, deque
 import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
 import sqlite3
+import struct
+import threading
 import time
 from datetime import datetime, timedelta
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -21,7 +26,7 @@ PRODUCTS = {
     "jua_individual": "Juazeiro Individual",
     "jua_emp": "Juazeiro Empreendimento",
 }
-SERVICE_VERSION = "2026-09-25-license-hardening"
+SERVICE_VERSION = "2026-09-29-admin-session"
 SERVER_SIGNATURE_FIELDS = ("license_key", "machine_id", "product", "ok", "status", "expires_at", "customer", "message", "issued_at")
 LICENSE_KEY_RE = re.compile(r"^DOCFLOW-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$")
 MACHINE_ID_RE = re.compile(r"^[0-9A-F]{32}$")
@@ -29,6 +34,13 @@ MAX_POST_BYTES = 16 * 1024
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 80
 RATE_LIMITS = defaultdict(deque)
+ADMIN_LOGIN_ATTEMPTS = defaultdict(deque)
+ADMIN_LOGIN_WINDOW = 5 * 60
+ADMIN_LOGIN_MAX = 5
+ADMIN_SESSIONS = {}
+ADMIN_SESSION_CSRF = {}
+ADMIN_SESSION_LOCK = threading.Lock()
+ADMIN_LAST_TOTP_COUNTER = -1
 
 
 def load_env_file():
@@ -446,6 +458,260 @@ def usage_response(payload):
     return response
 
 
+def make_admin_password_hash(password, salt=None):
+    if len(str(password or "")) < 12:
+        raise ValueError("Senha administrativa deve ter pelo menos 12 caracteres.")
+    salt = salt or secrets.token_bytes(16)
+    n, r, p = 16384, 8, 1
+    digest = hashlib.scrypt(str(password).encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32)
+    return "scrypt${}${}${}${}${}".format(
+        n, r, p,
+        base64.urlsafe_b64encode(salt).decode("ascii").rstrip("="),
+        base64.urlsafe_b64encode(digest).decode("ascii").rstrip("="),
+    )
+
+
+def verify_admin_password(password):
+    encoded = os.getenv("FORJA_ADMIN_PASSWORD_HASH", "").strip()
+    try:
+        algorithm, n, r, p, salt_text, digest_text = encoded.split("$", 5)
+        if algorithm != "scrypt":
+            return False
+        salt = base64.urlsafe_b64decode(salt_text + "=" * (-len(salt_text) % 4))
+        expected = base64.urlsafe_b64decode(digest_text + "=" * (-len(digest_text) % 4))
+        actual = hashlib.scrypt(
+            str(password or "").encode("utf-8"),
+            salt=salt,
+            n=int(n), r=int(r), p=int(p), dklen=len(expected),
+        )
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def _totp_secret_bytes():
+    secret = re.sub(r"\s+", "", os.getenv("FORJA_ADMIN_TOTP_SECRET", "")).upper()
+    if len(secret) < 16 or not re.fullmatch(r"[A-Z2-7]+", secret):
+        return b""
+    try:
+        return base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    except Exception:
+        return b""
+
+
+def admin_totp_code(counter, secret_bytes=None):
+    secret_bytes = secret_bytes or _totp_secret_bytes()
+    digest = hmac.new(secret_bytes, struct.pack(">Q", int(counter)), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = (struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % 1000000
+    return f"{value:06d}"
+
+
+def verify_admin_totp(code, now=None):
+    code = str(code or "").strip()
+    secret_bytes = _totp_secret_bytes()
+    if not secret_bytes or not re.fullmatch(r"\d{6}", code):
+        return None
+    counter = int((time.time() if now is None else now) // 30)
+    for candidate in (counter - 1, counter, counter + 1):
+        if hmac.compare_digest(admin_totp_code(candidate, secret_bytes), code):
+            return candidate
+    return None
+
+
+def admin_auth_configured():
+    return bool(os.getenv("FORJA_ADMIN_PASSWORD_HASH", "").strip()) and bool(_totp_secret_bytes())
+
+
+def _admin_session_seconds():
+    try:
+        return min(3600, max(300, int(os.getenv("FORJA_ADMIN_SESSION_SECONDS", "1800"))))
+    except Exception:
+        return 1800
+
+
+def create_admin_session(password, totp_code):
+    global ADMIN_LAST_TOTP_COUNTER
+    if not admin_auth_configured():
+        return None
+    password_ok = verify_admin_password(password)
+    counter = verify_admin_totp(totp_code)
+    if not password_ok or counter is None:
+        return None
+    with ADMIN_SESSION_LOCK:
+        if counter <= ADMIN_LAST_TOTP_COUNTER:
+            return None
+        ADMIN_LAST_TOTP_COUNTER = counter
+        now = time.time()
+        expired = [key for key, expires in ADMIN_SESSIONS.items() if expires <= now]
+        for key in expired:
+            ADMIN_SESSIONS.pop(key, None)
+            ADMIN_SESSION_CSRF.pop(key, None)
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+        ADMIN_SESSIONS[token_hash] = now + _admin_session_seconds()
+        ADMIN_SESSION_CSRF[token_hash] = secrets.token_urlsafe(24)
+    return token
+
+
+def admin_session_valid(token):
+    if not token:
+        return False
+    token_hash = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+    with ADMIN_SESSION_LOCK:
+        expires = ADMIN_SESSIONS.get(token_hash, 0)
+        if expires <= time.time():
+            ADMIN_SESSIONS.pop(token_hash, None)
+            ADMIN_SESSION_CSRF.pop(token_hash, None)
+            return False
+    return True
+
+
+def discard_admin_session(token):
+    token_hash = hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+    with ADMIN_SESSION_LOCK:
+        ADMIN_SESSIONS.pop(token_hash, None)
+        ADMIN_SESSION_CSRF.pop(token_hash, None)
+
+
+def admin_session_csrf(token):
+    if not admin_session_valid(token):
+        return ""
+    token_hash = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+    with ADMIN_SESSION_LOCK:
+        return ADMIN_SESSION_CSRF.get(token_hash, "")
+
+
+def _admin_license_data(row):
+    expires_at = str(row["expires_at"] or "")
+    try:
+        days_remaining = (datetime.strptime(expires_at, "%Y-%m-%d").date() - today()).days
+    except Exception:
+        days_remaining = None
+    return {
+        "license_key": row["license_key"], "product": row["product"],
+        "customer": row["customer"], "status": row["status"],
+        "created_at": row["created_at"], "expires_at": expires_at,
+        "days_remaining": days_remaining, "max_machines": row["max_machines"],
+        "machines": row["machines"] if "machines" in row.keys() else 0,
+    }
+
+
+def admin_list_licenses(search=""):
+    search = str(search or "").strip()
+    where, params = "", []
+    if search:
+        where = "WHERE UPPER(l.license_key) LIKE ? OR LOWER(l.customer) LIKE ?"
+        params = [f"%{search.upper()}%", f"%{search.lower()}%"]
+    with connect() as conn:
+        rows = conn.execute(sql(f"""
+            SELECT l.license_key, l.product, l.customer, l.status, l.created_at,
+                   l.expires_at, l.max_machines, COUNT(a.machine_id) AS machines
+            FROM licenses l LEFT JOIN activations a ON a.license_key = l.license_key
+            {where}
+            GROUP BY l.license_key, l.product, l.customer, l.status, l.created_at,
+                     l.expires_at, l.max_machines
+            ORDER BY l.created_at DESC
+        """), params).fetchall()
+    return [_admin_license_data(row) for row in rows]
+
+
+def admin_get_license(license_key):
+    key = str(license_key or "").strip().upper()
+    with connect() as conn:
+        row = conn.execute(sql("""
+            SELECT l.license_key, l.product, l.customer, l.status, l.created_at,
+                   l.expires_at, l.max_machines, COUNT(a.machine_id) AS machines
+            FROM licenses l LEFT JOIN activations a ON a.license_key = l.license_key
+            WHERE l.license_key = ?
+            GROUP BY l.license_key, l.product, l.customer, l.status, l.created_at,
+                     l.expires_at, l.max_machines
+        """), (key,)).fetchone()
+    return _admin_license_data(row) if row else None
+
+
+def _admin_parse_date(value):
+    try:
+        return datetime.strptime(str(value or ""), "%Y-%m-%d").date().isoformat()
+    except Exception as exc:
+        raise ValueError("Data invalida. Use AAAA-MM-DD.") from exc
+
+
+def admin_create_license(payload):
+    customer = str(payload.get("customer", "")).strip()
+    product = normalize_product(payload.get("product"))
+    expires_at = _admin_parse_date(payload.get("expires_at"))
+    try:
+        max_machines = int(payload.get("max_machines", 1))
+    except Exception as exc:
+        raise ValueError("Limite de maquinas invalido.") from exc
+    if not customer or not product or max_machines < 1:
+        raise ValueError("Dados da licenca invalidos.")
+    key = make_key()
+    with connect() as conn:
+        conn.execute(sql("""
+            INSERT INTO licenses
+            (license_key, product, customer, status, expires_at, max_machines, daily_limit, notes, created_at)
+            VALUES (?, ?, ?, 'active', ?, ?, 0, ?, ?)
+        """), (key, product, customer, expires_at, max_machines,
+                 str(payload.get("notes", ""))[:500], datetime.now().isoformat(timespec="seconds")))
+    return admin_get_license(key)
+
+
+def admin_update_license(license_key, payload):
+    key = str(license_key or "").strip().upper()
+    if not admin_get_license(key):
+        return None
+    updates, params = [], []
+    if "expires_at" in payload:
+        updates.append("expires_at = ?")
+        params.append(_admin_parse_date(payload.get("expires_at")))
+    if "status" in payload:
+        status = str(payload.get("status", "")).strip().lower()
+        if status not in {"active", "blocked"}:
+            raise ValueError("Status invalido.")
+        updates.append("status = ?")
+        params.append(status)
+    if not updates:
+        raise ValueError("Nenhuma alteracao valida informada.")
+    with connect() as conn:
+        conn.execute(sql(f"UPDATE licenses SET {', '.join(updates)} WHERE license_key = ?"), (*params, key))
+    return admin_get_license(key)
+
+
+def admin_list_activations(license_key):
+    key = str(license_key or "").strip().upper()
+    if not admin_get_license(key):
+        return None
+    with connect() as conn:
+        rows = conn.execute(sql("""
+            SELECT machine_id, first_seen, last_seen FROM activations
+            WHERE license_key = ? ORDER BY last_seen DESC
+        """), (key,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def admin_unlink_activation(license_key, machine_id):
+    key = str(license_key or "").strip().upper()
+    machine = normalize_machine_id(machine_id)
+    if not machine:
+        raise ValueError("Identificador de maquina invalido.")
+    with connect() as conn:
+        row = conn.execute(sql("SELECT 1 FROM activations WHERE license_key = ? AND machine_id = ?"), (key, machine)).fetchone()
+        if not row:
+            return False
+        conn.execute(sql("DELETE FROM activation_aliases WHERE license_key = ? AND (machine_id = ? OR activation_machine_id = ?)"), (key, machine, machine))
+        conn.execute(sql("DELETE FROM activations WHERE license_key = ? AND machine_id = ?"), (key, machine))
+    return True
+
+
+def admin_audit(operation, license_key=""):
+    print(json.dumps({"event": "admin_audit", "operation": str(operation),
+                      "license_key": str(license_key or "").upper(),
+                      "created_at": datetime.now().isoformat(timespec="seconds")},
+                     ensure_ascii=False), flush=True)
+
+
 class LicenseHandler(BaseHTTPRequestHandler):
     def _client_ip(self):
         forwarded = self.headers.get("X-Forwarded-For", "")
@@ -464,16 +730,210 @@ class LicenseHandler(BaseHTTPRequestHandler):
         bucket.append(now)
         return False
 
-    def _send(self, status, data):
+    def _send(self, status, data, headers=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_asset(self, path, content_type):
+        try:
+            body = path.read_bytes()
+        except OSError:
+            self._send(404, {"ok": False, "message": "Nao encontrado."})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_admin_json(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > MAX_POST_BYTES:
+            raise ValueError("Requisicao grande demais.")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except Exception as exc:
+            raise ValueError("JSON invalido.") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("JSON invalido.")
+        return payload
+
+    def _bearer_token(self):
+        authorization = self.headers.get("Authorization", "").strip()
+        if authorization.lower().startswith("bearer "):
+            return authorization[7:].strip()
+        try:
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie", ""))
+            morsel = cookie.get("forja_admin_session")
+            return morsel.value if morsel else ""
+        except Exception:
+            return ""
+
+    def _using_cookie_session(self):
+        return not self.headers.get("Authorization", "").lower().startswith("bearer ") and bool(self._bearer_token())
+
+    def _require_admin_session(self):
+        if not admin_session_valid(self._bearer_token()):
+            self._send(401, {"ok": False, "message": "Sessao administrativa invalida ou expirada."})
+            return False
+        return True
+
+    def _require_admin_csrf(self):
+        if not self._using_cookie_session():
+            return True
+        supplied = self.headers.get("X-CSRF-Token", "").strip()
+        expected = admin_session_csrf(self._bearer_token())
+        if not supplied or not expected or not hmac.compare_digest(supplied, expected):
+            self._send(403, {"ok": False, "message": "Protecao CSRF invalida."})
+            return False
+        return True
+
+    def _login_limited(self):
+        now = time.time()
+        bucket = ADMIN_LOGIN_ATTEMPTS[self._client_ip()]
+        while bucket and now - bucket[0] > ADMIN_LOGIN_WINDOW:
+            bucket.popleft()
+        if len(bucket) >= ADMIN_LOGIN_MAX:
+            return True
+        bucket.append(now)
+        return False
+
+    def _admin_parts(self):
+        parsed = urlsplit(self.path)
+        return parsed, [unquote(part) for part in parsed.path.strip("/").split("/") if part]
+
+    def _admin_failure(self, exc):
+        print(f"admin_error={type(exc).__name__}", flush=True)
+        self._send(500, {"ok": False, "message": "Falha ao acessar administracao."})
+
+    def _handle_admin_login(self, web=False):
+        if self._login_limited():
+            self._send(429, {"ok": False, "message": "Muitas tentativas. Aguarde."})
+            return
+        if not admin_auth_configured():
+            self._send(503, {"ok": False, "message": "Autenticacao administrativa nao configurada."})
+            return
+        try:
+            payload = self._read_admin_json()
+        except ValueError as exc:
+            self._send(400, {"ok": False, "message": str(exc)})
+            return
+        token = create_admin_session(payload.get("password"), payload.get("totp"))
+        if not token:
+            self._send(401, {"ok": False, "message": "Credenciais invalidas."})
+            return
+        admin_audit("login")
+        if web:
+            max_age = _admin_session_seconds()
+            cookie = f"forja_admin_session={token}; Path=/admin; Max-Age={max_age}; HttpOnly; Secure; SameSite=Strict"
+            self._send(200, {"ok": True, "csrf_token": admin_session_csrf(token), "expires_in": max_age}, {"Set-Cookie": cookie})
+        else:
+            self._send(200, {"ok": True, "session_token": token, "expires_in": _admin_session_seconds()})
+
+    def _handle_admin_get(self):
+        if not self._require_admin_session():
+            return
+        parsed, parts = self._admin_parts()
+        try:
+            if parts == ["admin", "licenses"]:
+                search = parse_qs(parsed.query).get("search", [""])[0]
+                licenses = admin_list_licenses(search)
+                self._send(200, {"ok": True, "licenses": licenses, "count": len(licenses)})
+            elif len(parts) == 3 and parts[:2] == ["admin", "licenses"]:
+                item = admin_get_license(parts[2])
+                self._send(200, {"ok": True, "license": item}) if item else self._send(404, {"ok": False, "message": "Licenca nao encontrada."})
+            elif len(parts) == 4 and parts[:2] == ["admin", "licenses"] and parts[3] == "activations":
+                items = admin_list_activations(parts[2])
+                self._send(200, {"ok": True, "activations": items, "count": len(items)}) if items is not None else self._send(404, {"ok": False, "message": "Licenca nao encontrada."})
+            else:
+                self._send(404, {"ok": False, "message": "Rota administrativa nao encontrada."})
+        except Exception as exc:
+            self._admin_failure(exc)
+
+    def _handle_admin_create(self):
+        if not self._require_admin_session() or not self._require_admin_csrf():
+            return
+        try:
+            item = admin_create_license(self._read_admin_json())
+            admin_audit("create_license", item["license_key"])
+            self._send(201, {"ok": True, "license": item})
+        except ValueError as exc:
+            self._send(400, {"ok": False, "message": str(exc)})
+        except Exception as exc:
+            self._admin_failure(exc)
+
+    def _handle_admin_patch(self):
+        if not self._require_admin_session() or not self._require_admin_csrf():
+            return
+        _parsed, parts = self._admin_parts()
+        if len(parts) != 3 or parts[:2] != ["admin", "licenses"]:
+            self._send(404, {"ok": False, "message": "Rota administrativa nao encontrada."})
+            return
+        try:
+            payload = self._read_admin_json()
+            item = admin_update_license(parts[2], payload)
+            if not item:
+                self._send(404, {"ok": False, "message": "Licenca nao encontrada."})
+                return
+            operation = "change_expiration" if "expires_at" in payload else ("block_license" if payload.get("status") == "blocked" else "unblock_license")
+            admin_audit(operation, parts[2])
+            self._send(200, {"ok": True, "license": item})
+        except ValueError as exc:
+            self._send(400, {"ok": False, "message": str(exc)})
+        except Exception as exc:
+            self._admin_failure(exc)
+
+    def _handle_admin_delete(self):
+        if not self._require_admin_session() or not self._require_admin_csrf():
+            return
+        _parsed, parts = self._admin_parts()
+        if len(parts) != 5 or parts[:2] != ["admin", "licenses"] or parts[3] != "activations":
+            self._send(404, {"ok": False, "message": "Rota administrativa nao encontrada."})
+            return
+        try:
+            if not admin_unlink_activation(parts[2], parts[4]):
+                self._send(404, {"ok": False, "message": "Ativacao nao encontrada."})
+                return
+            admin_audit("unlink_activation", parts[2])
+            self._send(200, {"ok": True, "message": "Maquina desvinculada."})
+        except ValueError as exc:
+            self._send(400, {"ok": False, "message": str(exc)})
+        except Exception as exc:
+            self._admin_failure(exc)
+
     def do_GET(self):
-        if self.path == "/health":
+        parsed_path = urlsplit(self.path).path
+        if parsed_path in {"/admin", "/admin/"}:
+            self._send_asset(BASE_DIR / "admin_web.html", "text/html; charset=utf-8")
+        elif parsed_path == "/admin/admin.css":
+            self._send_asset(BASE_DIR / "admin_web.css", "text/css; charset=utf-8")
+        elif parsed_path == "/admin/admin.js":
+            self._send_asset(BASE_DIR / "admin_web.js", "application/javascript; charset=utf-8")
+        elif parsed_path == "/admin/session":
+            if not self._require_admin_session():
+                return
+            self._send(200, {"ok": True, "csrf_token": admin_session_csrf(self._bearer_token()), "expires_in": _admin_session_seconds()})
+        elif self.path.startswith("/admin/"):
+            if self._rate_limited():
+                self._send(429, {"ok": False, "message": "Muitas tentativas. Aguarde."})
+                return
+            self._handle_admin_get()
+        elif self.path == "/health":
             self._send(200, {
                 "ok": True,
                 "service": "docflow-license",
@@ -486,6 +946,30 @@ class LicenseHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self._rate_limited():
             self._send(429, {"ok": False, "message": "Muitas tentativas. Aguarde."})
+            return
+        if self.path == "/admin/login":
+            self._handle_admin_login()
+            return
+        if self.path == "/admin/web-login":
+            self._handle_admin_login(web=True)
+            return
+        if self.path == "/admin/logout":
+            if not self._require_admin_session() or not self._require_admin_csrf():
+                return
+            discard_admin_session(self._bearer_token())
+            admin_audit("logout")
+            self._send(200, {"ok": True})
+            return
+        if self.path == "/admin/web-logout":
+            if not self._require_admin_session() or not self._require_admin_csrf():
+                return
+            discard_admin_session(self._bearer_token())
+            admin_audit("logout")
+            expired = "forja_admin_session=; Path=/admin; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
+            self._send(200, {"ok": True}, {"Set-Cookie": expired})
+            return
+        if self.path == "/admin/licenses":
+            self._handle_admin_create()
             return
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length > MAX_POST_BYTES:
@@ -502,6 +986,24 @@ class LicenseHandler(BaseHTTPRequestHandler):
             self._send(200, sign_response(license_response(payload, activate=False), payload))
         elif self.path == "/usage":
             self._send(200, sign_response(usage_response(payload), payload))
+        else:
+            self._send(404, {"ok": False, "message": "Nao encontrado."})
+
+    def do_PATCH(self):
+        if self._rate_limited():
+            self._send(429, {"ok": False, "message": "Muitas tentativas. Aguarde."})
+            return
+        if self.path.startswith("/admin/licenses/"):
+            self._handle_admin_patch()
+        else:
+            self._send(404, {"ok": False, "message": "Nao encontrado."})
+
+    def do_DELETE(self):
+        if self._rate_limited():
+            self._send(429, {"ok": False, "message": "Muitas tentativas. Aguarde."})
+            return
+        if self.path.startswith("/admin/licenses/"):
+            self._handle_admin_delete()
         else:
             self._send(404, {"ok": False, "message": "Nao encontrado."})
 
@@ -593,6 +1095,9 @@ def cmd_list(_args):
                 """
             )
         ).fetchall()
+    if not rows:
+        print("Nenhuma chave encontrada.")
+        return
     for row in rows:
         daily = row["daily_limit"] if "daily_limit" in row.keys() else 0
         daily_text = "sem limite" if not daily else f"{daily}/dia"

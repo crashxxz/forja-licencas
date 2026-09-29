@@ -12,3 +12,9 @@ services:
         sync: false
       - key: DOCFLOW_LICENSE_PRIVATE_D
         sync: false
+      - key: FORJA_ADMIN_PASSWORD_HASH
+        sync: false
+      - key: FORJA_ADMIN_TOTP_SECRET
+        sync: false
+      - key: FORJA_ADMIN_SESSION_SECONDS
+        value: "1800"
